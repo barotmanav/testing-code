@@ -1,0 +1,226 @@
+"""
+Object Detection on Panorama pictures and videos
+Usage:
+    $ python detection.py --img <input_file> --output_frames <output_file>
+    $ python detection.py --video <input_file> --output_frames <output_file>
+    input_file (str):  the input panorama image or video
+    output_file (str): the output panorama image or video with bounding boxes
+"""
+
+import argparse
+import sys
+import cv2
+import imageio
+import json
+import numpy as np
+from yolov8_model_run import detect
+from stereo import panorama_to_stereo_multiprojections, stereo_bounding_boxes_to_panorama
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import queue
+
+def video_detection(input_video_path, stereographic_image_size, FOV, output_image_file_path, output_json_file_path, thread_count, seconds_process=-1):
+    """
+    Detect objects in a 360-degree video using multi-projection and YOLOv8.
+    """
+    try:
+        video_reader = cv2.VideoCapture(input_video_path)
+    except Exception as e:
+        print("Failed to read input video path:", e)
+        return
+
+    if not video_reader.isOpened():
+        print("Error: Could not open video.")
+        sys.exit(1)
+
+    annotated_panoramas = {}
+    panorama_detections = {}
+
+    fps = video_reader.get(cv2.CAP_PROP_FPS)
+    total_num_frames = int(video_reader.get(cv2.CAP_PROP_FRAME_COUNT))
+    if seconds_process > 0:
+        total_num_frames = min(total_num_frames, seconds_process * int(fps))
+    print("Frame Rate:", fps)
+    print("Total number of frames:", total_num_frames)
+
+    def process_frame(frame_count, pano_array, stereographic_image_size, FOV):
+        frames = panorama_to_stereo_multiprojections(pano_array, stereographic_image_size, FOV)
+        frames_detections_with_meta = []
+        for frame in frames:
+            detections = detect(frame['image'], confidence_threshold=0.45)
+            cleaned_detections = []
+            for detection in detections:
+                box = detection['box']
+                # shape[1]=width, shape[0]=height
+                if not (box[0] < 5 or box[1] < 5 or box[0] + box[2] > frame['image'].shape[1] - 5 or box[1] + box[3] > frame['image'].shape[0] - 5):
+                    cleaned_detections.append(detection)
+            detections_with_meta = (cleaned_detections, frame['yaw'], frame['pitch'])
+            frames_detections_with_meta.append(detections_with_meta)
+        frames_detections_with_meta_np = np.array(frames_detections_with_meta, dtype=object)
+        output_panorama_np, pano_detections = stereo_bounding_boxes_to_panorama(frames_detections_with_meta_np, pano_array, stereographic_image_size, FOV)
+        return (output_panorama_np, pano_detections, frame_count, 0)
+
+    if thread_count == 1:
+        print("Processing frames (single-threaded)")
+        for frame_count in tqdm(range(int(total_num_frames))):
+            ret, pano_array = video_reader.read()
+            if not ret:
+                print("Finished reading all frames before expected")
+                break
+            pano_array = cv2.resize(pano_array, (1920, 960))
+            output_panorama_np, pano_detections, fr_index, code = process_frame(frame_count, pano_array, stereographic_image_size, FOV)
+            if code != 0:
+                print(f"Task failed, code: {code}")
+            else:
+                annotated_panoramas[fr_index] = output_panorama_np
+                panorama_detections[fr_index] = pano_detections
+    else:
+        print("Processing frames (multi-threaded)")
+        futures = queue.Queue()
+        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+            for frame_count in tqdm(range(int(total_num_frames))):
+                ret, pano_array = video_reader.read()
+                if not ret:
+                    print("Finished reading all frames before expected")
+                    break
+                pano_array = cv2.resize(pano_array, (1920, 960))
+                future = executor.submit(process_frame, frame_count, pano_array, stereographic_image_size, FOV)
+                futures.put(future)
+                while futures.qsize() > thread_count * 2:
+                    future = futures.get()
+                    output_panorama_np, pano_detections, fr_index, code = future.result()
+                    if code != 0:
+                        print(f"Task failed, code: {code}")
+                    else:
+                        annotated_panoramas[fr_index] = output_panorama_np
+                        panorama_detections[fr_index] = pano_detections
+            # Drain remaining futures
+            while not futures.empty():
+                future = futures.get()
+                output_panorama_np, pano_detections, fr_index, code = future.result()
+                if code != 0:
+                    print(f"Task failed, code: {code}")
+                else:
+                    annotated_panoramas[fr_index] = output_panorama_np
+                    panorama_detections[fr_index] = pano_detections
+
+    video_reader.release()
+
+    # Save detections as JSON
+    json_pano_detections = {}
+    for fr_index in panorama_detections:
+        json_pano_detection = []
+        pano_dets = panorama_detections[fr_index]
+        if isinstance(pano_dets, np.ndarray):
+            for detection in pano_dets:
+                if isinstance(detection, (list, np.ndarray)):
+                    for det in detection:
+                        json_pano_detection.append(det)
+                else:
+                    json_pano_detection.append(detection)
+        else:
+            json_pano_detection.append(pano_dets)
+        json_pano_detections[fr_index] = json_pano_detection
+
+    if output_json_file_path:
+        with open(output_json_file_path, "w") as outfile:
+            json.dump(json_pano_detections, outfile, indent=4)
+
+    # Save output video
+    if output_image_file_path:
+        video_writer = imageio.get_writer(output_image_file_path, fps=int(fps))
+        print("Writing frames")
+        for i in tqdm(range(int(total_num_frames))):
+            output_image = annotated_panoramas.get(i)
+            if output_image is not None:
+                rgb_image = cv2.cvtColor(output_image, cv2.COLOR_BGR2RGB)
+                video_writer.append_data(rgb_image)
+        video_writer.close()
+        print("The annotated 360 video file has been written successfully.")
+
+def image_detection(input_panorama_path, stereographic_image_size, FOV, output_image_file_path, output_json_file_path):
+    """
+    Detect objects in a single 360-degree image using multi-projection and YOLOv8.
+    """
+    pano_array = cv2.imread(input_panorama_path)
+    if pano_array is None:
+        raise IOError("The image could not be opened or is empty.")
+
+    frames = panorama_to_stereo_multiprojections(pano_array, stereographic_image_size, FOV)
+    frames_detections_with_meta = []
+    for frame in frames:
+        detections = detect(frame['image'], confidence_threshold=0.45)
+        cleaned_detections = []
+        for detection in detections:
+            box = detection['box']
+            if not (box[0] < 5 or box[1] < 5 or box[0] + box[2] > frame['image'].shape[1] - 5 or box[1] + box[3] > frame['image'].shape[0] - 5):
+                cleaned_detections.append(detection)
+        detections_with_meta = (cleaned_detections, frame['yaw'], frame['pitch'])
+        frames_detections_with_meta.append(detections_with_meta)
+    frames_detections_with_meta_np = np.array(frames_detections_with_meta, dtype=object)
+    output_panorama_np, panorama_detections = stereo_bounding_boxes_to_panorama(frames_detections_with_meta_np, pano_array, stereographic_image_size, FOV)
+
+    # Save detections as JSON
+    json_pano_detections = []
+    if isinstance(panorama_detections, np.ndarray):
+        for detection in panorama_detections:
+            if isinstance(detection, (list, np.ndarray)):
+                for det in detection:
+                    json_pano_detections.append(det)
+            else:
+                json_pano_detections.append(detection)
+    else:
+        json_pano_detections.append(panorama_detections)
+
+    if output_json_file_path:
+        with open(output_json_file_path, "w") as outfile:
+            json.dump(json_pano_detections, outfile, indent=4)
+
+    if output_image_file_path:
+        cv2.imwrite(output_image_file_path, output_panorama_np)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="model-runs/detect/train/weights/yolov8n.onnx", help="Input your ONNX model.")
+    parser.add_argument("--video", help="Path to input 360 video.")
+    parser.add_argument("--img", help="Path to input 360 image.")
+    parser.add_argument("--stereo_image_size", help="The size in pixels of the stereographic images derived from the panorama", default="640x640")
+    parser.add_argument("--FOV", help="Field of view for projections, format ThetaxPhi", default="180x180")
+    parser.add_argument("--output_detections", help="Path to output json file for the detections.", default=None)
+    parser.add_argument("--output_frames", help="Path to output frame(s).", default=None)
+    parser.add_argument("--threads", type=int, help="Number of threads for parallelization (video only)", default=1)
+    parser.add_argument("--seconds_process", type=int, help="Number of seconds in the video (from the start) to process", default=-1)
+    args = parser.parse_args()
+
+    try:
+        width, height = map(int, args.stereo_image_size.split('x'))
+        stereographic_image_size = (width, height)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Size must be WxH, where W and H are integers.")
+
+    try:
+        theta, phi = map(int, args.FOV.split('x'))
+        FOV = (theta, phi)
+    except ValueError:
+        raise argparse.ArgumentTypeError("FOV Angles must be ThetaxPhi, where Theta and Phi are integers.")
+
+    output_image_file_path = args.output_frames
+    output_json_file_path = args.output_detections
+    thread_count = args.threads
+    seconds_process = args.seconds_process
+
+    if thread_count < 1:
+        raise argparse.ArgumentTypeError("thread_count must be an integer greater than zero.")
+
+    if args.video:
+        input_video_path = args.video
+        video_detection(input_video_path, stereographic_image_size, FOV, output_image_file_path, output_json_file_path, thread_count, seconds_process)
+    elif args.img:
+        input_panorama_path = args.img
+        image_detection(input_panorama_path, stereographic_image_size, FOV, output_image_file_path, output_json_file_path)
+    else:
+        print("Please provide either --video or --img as input.")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
